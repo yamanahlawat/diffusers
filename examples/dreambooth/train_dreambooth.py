@@ -141,6 +141,7 @@ def log_validation(
         revision=args.revision,
         variant=args.variant,
         torch_dtype=weight_dtype,
+        safety_checker=None,
         **pipeline_args,
     )
 
@@ -897,7 +898,8 @@ def main(args):
 
         if args.push_to_hub:
             repo_id = create_repo(
-                repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
+                repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token,
+                private=True
             ).repo_id
 
     # Load the tokenizer
@@ -1151,7 +1153,7 @@ def main(args):
     if accelerator.is_main_process:
         tracker_config = vars(copy.deepcopy(args))
         tracker_config.pop("validation_images")
-        accelerator.init_trackers("dreambooth", config=tracker_config)
+        accelerator.init_trackers(Path(args.output_dir).name, config=tracker_config)
 
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -1418,6 +1420,7 @@ def main(args):
                 folder_path=args.output_dir,
                 commit_message="End of training",
                 ignore_patterns=["step_*", "epoch_*"],
+                token=args.hub_token
             )
 
     accelerator.end_training()
