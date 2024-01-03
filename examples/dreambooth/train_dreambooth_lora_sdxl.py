@@ -890,7 +890,8 @@ def main(args):
 
         if args.push_to_hub:
             repo_id = create_repo(
-                repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
+                repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token,
+                private=True
             ).repo_id
 
     # Load the tokenizers
@@ -1340,7 +1341,7 @@ def main(args):
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        accelerator.init_trackers("dreambooth-lora-sd-xl", config=vars(args))
+        accelerator.init_trackers(Path(args.output_dir).name, config=vars(args))
 
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -1399,6 +1400,8 @@ def main(args):
             text_encoder_two.train()
 
             # set top parameter requires_grad = True for gradient checkpointing works
+            text_encoder_one = accelerator.unwrap_model(text_encoder_one)
+            text_encoder_two = accelerator.unwrap_model(text_encoder_two)
             text_encoder_one.text_model.embeddings.requires_grad_(True)
             text_encoder_two.text_model.embeddings.requires_grad_(True)
 
@@ -1600,6 +1603,7 @@ def main(args):
                     revision=args.revision,
                     variant=args.variant,
                     torch_dtype=weight_dtype,
+                    safety_checker=None,
                 )
 
                 # We train on the simplified learning objective. If we were previously predicting a variance, we need the scheduler to ignore it
@@ -1747,6 +1751,7 @@ def main(args):
                 folder_path=args.output_dir,
                 commit_message="End of training",
                 ignore_patterns=["step_*", "epoch_*"],
+                token=args.hub_token
             )
 
     accelerator.end_training()
