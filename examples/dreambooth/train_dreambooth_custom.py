@@ -1,18 +1,3 @@
-#!/usr/bin/env python
-# coding=utf-8
-# Copyright 2023 The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-
 import argparse
 import copy
 import gc
@@ -124,10 +109,7 @@ def log_validation(
         f" {args.validation_prompt}."
     )
 
-    pipeline_args = {}
-
-    if vae is not None:
-        pipeline_args["vae"] = vae
+    pipeline_args = {"vae": vae}
 
     if text_encoder is not None:
         text_encoder = accelerator.unwrap_model(text_encoder)
@@ -141,6 +123,7 @@ def log_validation(
         revision=args.revision,
         variant=args.variant,
         torch_dtype=weight_dtype,
+        safety_checker=None,
         **pipeline_args,
     )
 
@@ -169,7 +152,10 @@ def log_validation(
             "negative_prompt_embeds": negative_prompt_embeds,
         }
     else:
-        pipeline_args = {"prompt": args.validation_prompt}
+        pipeline_args = {
+            "prompt": args.validation_prompt,
+            "negative_prompt": args.validation_negative_prompt,
+        }
 
     # run inference
     generator = (
@@ -182,7 +168,10 @@ def log_validation(
         for _ in range(args.num_validation_images):
             with torch.autocast("cuda"):
                 image = pipeline(
-                    **pipeline_args, num_inference_steps=25, generator=generator
+                    **pipeline_args,
+                    num_inference_steps=args.validation_num_inference_steps,
+                    generator=generator,
+                    guidance_scale=args.validation_guidance_scale,
                 ).images[0]
             images.append(image)
     else:
@@ -335,12 +324,21 @@ def parse_args(input_args=None):
         "--seed", type=int, default=None, help="A seed for reproducible training."
     )
     parser.add_argument(
-        "--resolution",
+        "--width",
         type=int,
-        default=512,
+        default=768,
         help=(
-            "The resolution for input images, all the images in the train/validation dataset will be resized to this"
-            " resolution"
+            "The width for input images, all the images in the train/validation dataset will be resized to this"
+            " width"
+        ),
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=1024,
+        help=(
+            "The height for input images, all the images in the train/validation dataset will be resized to this"
+            " height"
         ),
     )
     parser.add_argument(
@@ -458,11 +456,6 @@ def parse_args(input_args=None):
         help="Power factor of the polynomial scheduler.",
     )
     parser.add_argument(
-        "--use_8bit_adam",
-        action="store_true",
-        help="Whether or not to use 8-bit Adam from bitsandbytes.",
-    )
-    parser.add_argument(
         "--dataloader_num_workers",
         type=int,
         default=0,
@@ -483,7 +476,7 @@ def parse_args(input_args=None):
         help="The beta2 parameter for the Adam optimizer.",
     )
     parser.add_argument(
-        "--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use."
+        "--weight_decay", type=float, default=1e-2, help="Weight decay to use."
     )
     parser.add_argument(
         "--adam_epsilon",
@@ -542,6 +535,12 @@ def parse_args(input_args=None):
         type=str,
         default=None,
         help="A prompt that is used during validation to verify that the model is learning.",
+    )
+    parser.add_argument(
+        "--validation_negative_prompt",
+        type=str,
+        default=None,
+        help="A negative prompt that is used during validation to verify that the model is learning.",
     )
     parser.add_argument(
         "--num_validation_images",
@@ -658,8 +657,43 @@ def parse_args(input_args=None):
         "--validation_scheduler",
         type=str,
         default="DPMSolverMultistepScheduler",
-        choices=["DPMSolverMultistepScheduler", "DDPMScheduler"],
+        choices=[
+            "DPMSolverMultistepScheduler",
+            "DDPMScheduler",
+            "EulerAncestralDiscreteScheduler",
+        ],
         help="Select which scheduler to use for validation. DDPMScheduler is recommended for DeepFloyd IF.",
+    )
+    parser.add_argument(
+        "--validation_num_inference_steps",
+        default=35,
+        type=int,
+        help="The number of inference steps used for validation",
+    )
+    parser.add_argument(
+        "--validation_guidance_scale",
+        default=7,
+        type=float,
+        help="The guidance scale for classifier-free guidance for validation",
+    )
+    parser.add_argument(
+        "--cache_latents",
+        action="store_true",
+        default=False,
+        help="Cache the VAE latents",
+    )
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="adamw",
+        choices=["adamw", "adamw_8bit", "lion", "lion_8bit"],
+        help="Select which optimizer to use",
+    )
+    parser.add_argument(
+        "--no_half_vae",
+        action="store_true",
+        default=False,
+        help="Disable half-precision for the VAE fp16/b16",
     )
 
     if input_args is not None:
@@ -709,12 +743,14 @@ class DreamBoothDataset(Dataset):
         class_data_root=None,
         class_prompt=None,
         class_num=None,
-        size=512,
+        size=(768, 1024),
         center_crop=False,
         encoder_hidden_states=None,
         class_prompt_encoder_hidden_states=None,
         tokenizer_max_length=None,
     ):
+        logger.info("Initializing DreamBoothDataset")
+
         self.size = size
         self.center_crop = center_crop
         self.tokenizer = tokenizer
@@ -730,6 +766,7 @@ class DreamBoothDataset(Dataset):
 
         self.instance_images_path = list(Path(instance_data_root).iterdir())
         self.num_instance_images = len(self.instance_images_path)
+        logger.info(f"Number of instance images: {self.num_instance_images}")
         self.instance_prompt = instance_prompt
         self._length = self.num_instance_images
 
@@ -741,6 +778,7 @@ class DreamBoothDataset(Dataset):
                 self.num_class_images = min(len(self.class_images_path), class_num)
             else:
                 self.num_class_images = len(self.class_images_path)
+            logger.info(f"Number of class images: {self.num_class_images}")
             self._length = max(self.num_class_images, self.num_instance_images)
             self.class_prompt = class_prompt
         else:
@@ -758,6 +796,7 @@ class DreamBoothDataset(Dataset):
                 transforms.Normalize([0.5], [0.5]),
             ]
         )
+        logger.info(f"Image transforms: {self.image_transforms}")
 
     def __len__(self):
         return self._length
@@ -768,7 +807,7 @@ class DreamBoothDataset(Dataset):
         )
         instance_image = exif_transpose(instance_image)
 
-        if not instance_image.mode == "RGB":
+        if instance_image.mode != "RGB":
             instance_image = instance_image.convert("RGB")
         example = {"instance_images": self.image_transforms(instance_image)}
         if self.encoder_hidden_states is not None:
@@ -788,7 +827,7 @@ class DreamBoothDataset(Dataset):
             )
             class_image = exif_transpose(class_image)
 
-            if not class_image.mode == "RGB":
+            if class_image.mode != "RGB":
                 class_image = class_image.convert("RGB")
             example["class_images"] = self.image_transforms(class_image)
 
@@ -1040,9 +1079,21 @@ def main(args):
     )
 
     if args.pretrained_vae_model_name_or_path:
-        vae = AutoencoderKL.from_single_file(
-            pretrained_model_link_or_path=args.pretrained_vae_model_name_or_path
-        )
+        # todo: move formats to enum or constants
+        if Path(args.pretrained_vae_model_name_or_path).suffix in [
+            ".ckpt",
+            ".safetensors",
+        ]:
+            vae = AutoencoderKL.from_single_file(
+                pretrained_model_link_or_path=args.pretrained_vae_model_name_or_path
+            )
+        else:
+            vae = AutoencoderKL.from_pretrained(
+                args.pretrained_vae_model_name_or_path,
+                subfolder="vae",
+                revision=args.revision,
+                variant=args.variant,
+            )
     else:
         vae = AutoencoderKL.from_pretrained(
             args.pretrained_model_name_or_path,
@@ -1096,12 +1147,7 @@ def main(args):
     accelerator.register_save_state_pre_hook(save_model_hook)
     accelerator.register_load_state_pre_hook(load_model_hook)
 
-    import ipdb
-
-    ipdb.set_trace()
-
-    if vae is not None:
-        vae.requires_grad_(False)
+    vae.requires_grad_(False)
 
     if not args.train_text_encoder:
         text_encoder.requires_grad_(False)
@@ -1159,32 +1205,77 @@ def main(args):
             * accelerator.num_processes
         )
 
-    # Use 8-bit Adam for lower memory usage or to fine-tune the model in 16GB GPUs
-    if args.use_8bit_adam:
-        try:
-            import bitsandbytes as bnb
-        except ImportError:
-            raise ImportError(
-                "To use 8-bit Adam, please install the bitsandbytes library: `pip install bitsandbytes`."
-            )
-
-        optimizer_class = bnb.optim.AdamW8bit
-    else:
-        optimizer_class = torch.optim.AdamW
-
-    # Optimizer creation
     params_to_optimize = (
         itertools.chain(unet.parameters(), text_encoder.parameters())
         if args.train_text_encoder
         else unet.parameters()
     )
-    optimizer = optimizer_class(
-        params_to_optimize,
-        lr=args.learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,
-    )
+
+    # Optimizer creation
+    # Use 8-bit Adam for lower memory usage or to fine-tune the model in 16GB GPUs
+    if args.optimizer in ["adamw_8bit", "lion_8bit"]:
+        try:
+            from bitsandbytes import optim
+        except ImportError:
+            raise ImportError(
+                "To use 8-bit optimizers like AdamW or Lion, please install the bitsandbytes library: `pip install bitsandbytes`."
+            )
+        if args.optimizer == "adamw_8bit":
+            logger.info(
+                f"Using 8-bit Adam optimizer with lr: {args.learning_rate}, beta1: {args.adam_beta1}, beta2: {args.adam_beta2}, eps: {args.adam_epsilon}"
+            )
+            optimizer = optim.AdamW8bit(
+                params_to_optimize,
+                lr=args.learning_rate,
+                betas=(args.adam_beta1, args.adam_beta2),
+                weight_decay=args.weight_decay,
+                eps=args.adam_epsilon,
+            )
+
+        if args.optimizer == "lion_8bit":
+            logger.info(
+                f"Using Lion8bit optimizer with weight decay: {args.weight_decay}"
+            )
+
+            optimizer = optim.Lion8bit(
+                params_to_optimize,
+                lr=args.learning_rate,
+                betas=(0.9, 0.99),
+                weight_decay=args.weight_decay,
+                is_paged=False,
+                percentile_clipping=100,
+                block_wise=True,
+                min_8bit_size=4096,
+            )
+    elif args.optimizer == "adamw":
+        logger.info(
+            f"Using AdamW optimizer with weight decay: {args.weight_decay}, beta1: {args.adam_beta1}, beta2: {args.adam_beta2}, eps: {args.adam_epsilon}"
+        )
+        optimizer = torch.optim.AdamW(
+            params_to_optimize,
+            lr=args.learning_rate,
+            betas=(args.adam_beta1, args.adam_beta2),
+            weight_decay=args.weight_decay,
+            eps=args.adam_epsilon,
+        )
+    elif args.optimizer == "lion":
+        try:
+            from pytorch_optimizer import Lion
+        except ImportError:
+            raise ImportError(
+                "To use Lion optimizer, please install the pytorch_optimizer library: `pip install pytorch_optimizer`."
+            )
+        logger.info(f"Using Lion optimizer with weight decay: {args.weight_decay}")
+
+        optimizer = Lion(
+            params_to_optimize,
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+            weight_decouple=True,
+            fixed_decay=False,
+            use_gc=False,
+            adanorm=False,
+        )
 
     if args.pre_compute_text_embeddings:
 
@@ -1205,7 +1296,9 @@ def main(args):
         pre_computed_encoder_hidden_states = compute_text_embeddings(
             args.instance_prompt
         )
-        validation_prompt_negative_prompt_embeds = compute_text_embeddings("")
+        validation_prompt_negative_prompt_embeds = compute_text_embeddings(
+            args.validation_negative_prompt or ""
+        )
 
         if args.validation_prompt is not None:
             validation_prompt_encoder_hidden_states = compute_text_embeddings(
@@ -1240,7 +1333,7 @@ def main(args):
         class_prompt=args.class_prompt,
         class_num=args.num_class_images,
         tokenizer=tokenizer,
-        size=args.resolution,
+        size=(args.width, args.height),
         center_crop=args.center_crop,
         encoder_hidden_states=pre_computed_encoder_hidden_states,
         class_prompt_encoder_hidden_states=pre_computed_class_prompt_encoder_hidden_states,
@@ -1298,11 +1391,27 @@ def main(args):
         weight_dtype = torch.bfloat16
 
     # Move vae and text_encoder to device and cast to weight_dtype
-    if vae is not None:
-        vae.to(accelerator.device, dtype=weight_dtype)
+    vae_dtype = torch.float32 if args.no_half_vae else weight_dtype
+    vae.to(accelerator.device, dtype=vae_dtype)
 
     if not args.train_text_encoder and text_encoder is not None:
         text_encoder.to(accelerator.device, dtype=weight_dtype)
+
+    vae_scaling_factor = vae.config.scaling_factor
+
+    if args.cache_latents:
+        latents_cache = []
+        for batch in tqdm(train_dataloader, desc="Caching latents"):
+            with torch.no_grad():
+                batch["pixel_values"] = batch["pixel_values"].to(
+                    accelerator.device, non_blocking=True, dtype=weight_dtype
+                )
+                latents_cache.append(vae.encode(batch["pixel_values"]).latent_dist)
+
+        if args.validation_prompt is None:
+            del vae
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(
@@ -1381,14 +1490,16 @@ def main(args):
             text_encoder.train()
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
-                pixel_values = batch["pixel_values"].to(dtype=weight_dtype)
-
-                if vae is not None:
-                    # Convert images to latent space
-                    model_input = vae.encode(pixel_values).latent_dist.sample()
-                    model_input = model_input * vae.config.scaling_factor
+                if args.cache_latents:
+                    model_input = latents_cache[step].sample()
                 else:
-                    model_input = pixel_values
+                    pixel_values = batch["pixel_values"].to(dtype=weight_dtype)
+                    model_input = vae.encode(pixel_values).latent_dist.sample()
+
+                model_input = model_input * vae_scaling_factor
+
+                if args.pretrained_vae_model_name_or_path is None:
+                    model_input = model_input.to(weight_dtype)
 
                 # Sample noise that we'll add to the model input
                 if args.offset_noise:
